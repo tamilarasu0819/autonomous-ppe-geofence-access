@@ -4,3 +4,5 @@ __pycache__/
 evidence_snapshots/
 *.log
 backend/snapshots/
+dist/
+frontend/dist/

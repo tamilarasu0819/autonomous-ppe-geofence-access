@@ -12,6 +12,10 @@ import yaml
 import cv2
 import numpy as np
 
+import queue
+import threading
+import requests
+
 # Configure logger
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +30,66 @@ from detector import PPEDetector
 from geofence import SpatialGeofence
 from telematics import TelematicsController, TOKEN_ALLOW, TOKEN_DENIED
 from telemetry import TelemetryDispatcher
+
+
+class StreamBroadcaster:
+    """
+    Asynchronously encodes and transmits live annotated video frames
+    to the central FastAPI backend MJPEG stream buffer.
+    """
+    def __init__(self, stream_url: str = "http://127.0.0.1:8000/api/stream/frame", target_fps: int = 25):
+        self.stream_url = stream_url
+        self.interval = 1.0 / max(1, target_fps)
+        self._last_send = 0.0
+        self._queue = queue.Queue(maxsize=1)
+        self._stopped = False
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="StreamBroadcasterThread")
+        self._thread.start()
+        logger.info("StreamBroadcaster initialized -> %s (@ ~%d FPS)", self.stream_url, target_fps)
+
+    def send_frame(self, frame: np.ndarray):
+        now = time.time()
+        if (now - self._last_send) < self.interval:
+            return
+        self._last_send = now
+
+        # Non-blocking enqueue with latest-frame-only retention
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._queue.put_nowait(frame)
+        except Exception:
+            pass
+
+    def _worker(self):
+        session = requests.Session()
+        while not self._stopped:
+            try:
+                frame = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ret:
+                    session.post(
+                        self.stream_url,
+                        data=jpeg.tobytes(),
+                        headers={"Content-Type": "image/jpeg"},
+                        timeout=0.3
+                    )
+            except Exception:
+                # Frame posting failures log silently without crashing or interrupting CV loop
+                pass
+            finally:
+                self._queue.task_done()
+
+    def stop(self):
+        self._stopped = True
+
 
 
 def load_config(config_path: str) -> dict:
@@ -235,6 +299,8 @@ def main():
     parser.add_argument("--source", type=str, default=None, help="Override camera source index or RTSP URL")
     parser.add_argument("--mock-hardware", action="store_true", default=None, help="Force mock hardware mode")
     parser.add_argument("--headless", action="store_true", help="Run without OpenCV GUI display window")
+    parser.add_argument("--stream-url", type=str, default=None, help="Target backend MJPEG frame ingest URL")
+    parser.add_argument("--stream-fps", type=int, default=25, help="Target stream FPS to backend buffer")
     args = parser.parse_args()
 
     # Load configuration
@@ -258,11 +324,16 @@ def main():
     if args.mock_hardware is not None:
         mock_hardware = args.mock_hardware
 
+    stream_endpoint = args.stream_url if args.stream_url else telemetry_cfg.get(
+        "stream_url", "http://127.0.0.1:8000/api/stream/frame"
+    )
+
     logger.info("==========================================================")
     logger.info("Initializing Autonomous PPE Access Control Edge Engine")
     logger.info("Camera Source: %s", cam_source)
     logger.info("Mock Hardware: %s", mock_hardware)
     logger.info("Hazard Zone: %s (%s)", geofence_cfg.get("zone_id"), geofence_cfg.get("zone_name"))
+    logger.info("Live Stream Endpoint: %s (@ %d FPS)", stream_endpoint, args.stream_fps)
     logger.info("==========================================================")
 
     # 1. Initialize Video Capture
@@ -308,6 +379,12 @@ def main():
         enabled=telemetry_cfg.get("enabled", True),
         snapshot_dir=telemetry_cfg.get("snapshot_dir", "evidence_snapshots"),
         cooldown_seconds=telemetry_cfg.get("cooldown_seconds", 4.0)
+    )
+
+    # 6. Initialize Live Video Stream Broadcaster
+    streamer = StreamBroadcaster(
+        stream_url=stream_endpoint,
+        target_fps=args.stream_fps
     )
 
     current_barrier_state = TOKEN_ALLOW
@@ -367,30 +444,34 @@ def main():
             for person, eval_data in violations_in_hazard:
                 telemetry.record_violation(frame, person, eval_data)
 
-            # Step 6: Visual Rendering
+            # Step 6: Visual Rendering & Frame Annotation
+            annotated_frame = frame.copy()
+
+            # Render hazard polygon overlay
+            is_alert = (current_barrier_state == TOKEN_DENIED)
+            annotated_frame = geofence.render_overlay(annotated_frame, is_alert_active=is_alert)
+
+            # Render individual person annotations
+            for person, eval_data in zip(persons, evaluations):
+                annotated_frame = render_person_annotations(annotated_frame, person, eval_data)
+
+            # Render Top HUD & Barrier Badge
+            annotated_frame = draw_hud(
+                annotated_frame,
+                barrier_state=current_barrier_state,
+                fps=current_fps,
+                person_count=len(persons),
+                violation_count=len(violations_in_hazard),
+                mock_ppe_mode=detector.mock_ppe_simulation,
+                sim_compliant_override=sim_compliant_override
+            )
+
+            # Step 7: Push Frame to Backend Live Stream Buffer
+            streamer.send_frame(annotated_frame)
+
+            # Local Window GUI
             if not args.headless:
-                display_frame = frame.copy()
-
-                # Render hazard polygon overlay
-                is_alert = (current_barrier_state == TOKEN_DENIED)
-                display_frame = geofence.render_overlay(display_frame, is_alert_active=is_alert)
-
-                # Render individual person annotations
-                for person, eval_data in zip(persons, evaluations):
-                    display_frame = render_person_annotations(display_frame, person, eval_data)
-
-                # Render Top HUD & Barrier Badge
-                display_frame = draw_hud(
-                    display_frame,
-                    barrier_state=current_barrier_state,
-                    fps=current_fps,
-                    person_count=len(persons),
-                    violation_count=len(violations_in_hazard),
-                    mock_ppe_mode=detector.mock_ppe_simulation,
-                    sim_compliant_override=sim_compliant_override
-                )
-
-                cv2.imshow(window_name, display_frame)
+                cv2.imshow(window_name, annotated_frame)
 
                 # Handle keyboard inputs
                 key = cv2.waitKey(1) & 0xFF
@@ -402,13 +483,14 @@ def main():
                     logger.info("Toggled Mock PPE override. Compliant: %s", sim_compliant_override)
                 elif key in (ord('s'), ord('S')):
                     manual_path = os.path.join(telemetry.snapshot_dir, f"manual_snapshot_{int(time.time())}.jpg")
-                    cv2.imwrite(manual_path, display_frame)
+                    cv2.imwrite(manual_path, annotated_frame)
                     logger.info("Saved manual snapshot: %s", manual_path)
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received.")
     finally:
         logger.info("Cleaning up pipeline resources...")
+        streamer.stop()
         camera.stop()
         telemetry.stop()
         telematics.close()

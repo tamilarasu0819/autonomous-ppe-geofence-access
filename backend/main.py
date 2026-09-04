@@ -4,13 +4,23 @@ Autonomous PPE Verification and Perimeter Access Control
 """
 
 import os
+import sys
 import time
 import logging
+import asyncio
+import subprocess
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+# In-memory buffer holding the latest JPEG frame from Edge Engine
+latest_frame: Optional[bytes] = None
+
+# Global reference to running Edge Engine subprocess
+edge_process: Optional[subprocess.Popen] = None
 
 from storage import IncidentStorage
 
@@ -156,3 +166,105 @@ async def websocket_alerts_endpoint(websocket: WebSocket):
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+@app.post("/api/stream/frame")
+async def upload_stream_frame(request: Request):
+    """
+    Receives raw JPEG encoded byte frames from the Edge Engine
+    and updates the in-memory MJPEG broadcast buffer.
+    """
+    global latest_frame
+    frame_bytes = await request.body()
+    if frame_bytes:
+        latest_frame = frame_bytes
+    return {"status": "ok"}
+
+
+@app.get("/api/stream/video")
+async def stream_video():
+    """
+    Streams the live OpenCV/YOLOv8 annotated edge camera feed
+    as an MJPEG multipart stream to browser clients.
+    """
+    async def frame_generator():
+        while True:
+            if latest_frame is not None:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + latest_frame + b"\r\n"
+                )
+            await asyncio.sleep(0.033)  # ~30 FPS throttle to eliminate CPU spinning
+
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.get("/api/edge/status")
+def get_edge_status():
+    """
+    Returns whether the edge vision engine process is actively running.
+    """
+    is_running = edge_process is not None and edge_process.poll() is None
+    return {"running": is_running}
+
+
+@app.post("/api/edge/start")
+def start_edge_engine():
+    """
+    Spawns edge_engine/main.py as an asynchronous subprocess.
+    """
+    global edge_process
+    if edge_process is not None and edge_process.poll() is None:
+        return {"status": "already_running"}
+
+    # Resolve project root and edge_engine script path
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    edge_script = os.path.join(project_root, "edge_engine", "main.py")
+    if not os.path.exists(edge_script):
+        edge_script = "edge_engine/main.py"
+        project_root = os.getcwd()
+
+    cmd = [sys.executable, edge_script]
+    logger.info("Launching Edge Engine: %s in cwd: %s", cmd, project_root)
+
+    try:
+        edge_process = subprocess.Popen(
+            cmd,
+            cwd=project_root
+        )
+        return {"status": "started", "pid": edge_process.pid}
+    except Exception as e:
+        logger.error("Failed to start Edge Engine: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/edge/stop")
+def stop_edge_engine():
+    """
+    Terminates the edge engine process and resets the live frame buffer.
+    """
+    global edge_process, latest_frame
+    if edge_process is not None and edge_process.poll() is None:
+        logger.info("Stopping Edge Engine (PID %s)...", edge_process.pid)
+        try:
+            edge_process.terminate()
+            try:
+                edge_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                logger.warning("Edge Engine did not exit within timeout; killing...")
+                edge_process.kill()
+        except Exception as e:
+            logger.error("Error stopping Edge Engine: %s", e)
+        finally:
+            edge_process = None
+            latest_frame = None
+        return {"status": "stopped"}
+    else:
+        edge_process = None
+        latest_frame = None
+        return {"status": "not_running"}
+
+

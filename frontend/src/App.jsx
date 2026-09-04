@@ -17,6 +17,8 @@ import {
   Volume2
 } from 'lucide-react';
 
+import LiveCameraStream from './components/LiveCameraStream.jsx';
+
 const API_BASE = "http://127.0.0.1:8000";
 const WS_BASE = "ws://127.0.0.1:8000/ws/alerts";
 
@@ -246,15 +248,19 @@ export default function App() {
 
         {/* Main Incident Feed & Snapshot Viewer */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Incident Log Feed */}
-          <div className="lg:col-span-2 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2">
-                <Clock className="w-4 h-4 text-slate-400" />
-                <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-                  Incident Telemetry Feed ({filteredIncidents.length})
-                </h2>
-              </div>
+          {/* Left Column: Live Edge Camera Stream & Incident Log Feed */}
+          <div className="lg:col-span-2 space-y-6">
+            {/* Live Edge Camera Stream Card */}
+            <LiveCameraStream />
+
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <Clock className="w-4 h-4 text-slate-400" />
+                  <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
+                    Incident Telemetry Feed ({filteredIncidents.length})
+                  </h2>
+                </div>
               <div className="flex space-x-2">
                 <button
                   onClick={() => setFilterZone('ALL')}
@@ -348,6 +354,7 @@ export default function App() {
                 })}
               </div>
             )}
+            </div>
           </div>
 
           {/* Evidence Snapshot Inspector Panel */}

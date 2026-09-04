@@ -71,6 +71,7 @@ telematics:
 
 telemetry:
   backend_url: "http://127.0.0.1:8000/api/violations"
+  stream_url: "http://127.0.0.1:8000/api/stream/frame"
   enabled: true
   snapshot_dir: "evidence_snapshots"
   cooldown_seconds: 4.0  # Prevent spamming alerts for the same violation within N seconds
