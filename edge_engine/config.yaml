@@ -1,0 +1,76 @@
+# Autonomous PPE Verification & Perimeter Access Control Configuration
+
+camera:
+  # Source: 0 (default laptop webcam), 1 (USB webcam), or "rtsp://user:pass@ip:port/h264"
+  source: 0
+  width: 1280
+  height: 720
+  fps: 30
+  reconnect_timeout_sec: 5
+  max_reconnect_attempts: 10
+  buffer_size: 1
+
+detector:
+  model_path: "yolov8n.pt"  # Auto-downloads lightweight YOLOv8 nano
+  confidence_threshold: 0.45
+  iou_threshold: 0.45
+  device: "cpu"  # "cpu", "cuda", or "0"
+  
+  # Target gear requirements for physical perimeter access
+  # In standard COCO: class 0 is 'person'. We detect persons and inspect head/torso regions.
+  # For simulation/mock PPE mode or dedicated PPE weights:
+  required_gear:
+    - "helmet"
+    - "vest"
+  
+  # When using standard COCO yolov8n without fine-tuned weights, enable mock_ppe_simulation
+  # to test full pipeline workflow or toggle via keypress 'm' in UI.
+  mock_ppe_simulation: true
+
+geofence:
+  # 4-Point image-space calibration coordinates for homography matrix H
+  # Maps perspective view points to a top-down metric ground plane (meters)
+  calibration_image_points:
+    - [200, 650]   # Bottom-left in camera view
+    - [1080, 650]  # Bottom-right in camera view
+    - [850, 320]   # Top-right in camera view
+    - [430, 320]   # Top-left in camera view
+
+  calibration_ground_points:
+    - [0.0, 0.0]   # Bottom-left (x=0m, y=0m)
+    - [5.0, 0.0]   # Bottom-right (x=5m, y=0m)
+    - [5.0, 8.0]   # Top-right (x=5m, y=8m)
+    - [0.0, 8.0]   # Top-left (x=0m, y=8m)
+
+  # Hazard Exclusion Zone defined as a 4-point polygon in image pixel coordinates
+  # (Can also be tested against warped ground plane)
+  hazard_polygon_image:
+    - [350, 680]
+    - [930, 680]
+    - [780, 380]
+    - [500, 380]
+
+  # Zone identification
+  zone_id: "HAZARD_ZONE_A1_EXCAVATION"
+  zone_name: "Excavation Pit & Heavy Machinery Perimeter"
+
+telematics:
+  # Hardware Abstraction Layer configuration
+  mock_mode: true
+  serial_port: "COM3"  # e.g., "COM3" on Windows, "/dev/ttyUSB0" on Linux
+  baud_rate: 115200
+  timeout: 0.1
+  
+  # Packet protocol bytes
+  start_byte: 0xAA
+  stop_byte: 0x55
+  
+  # State tokens
+  token_allow: 0x01
+  token_denied: 0x02
+
+telemetry:
+  backend_url: "http://127.0.0.1:8000/api/violations"
+  enabled: true
+  snapshot_dir: "evidence_snapshots"
+  cooldown_seconds: 4.0  # Prevent spamming alerts for the same violation within N seconds
