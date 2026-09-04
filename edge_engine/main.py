@@ -6,6 +6,10 @@ Phase 1 Core Vision, Geofencing, and Telematics Pipeline
 import os
 import sys
 import time
+import os
+import sys
+import time
+import signal
 import argparse
 import logging
 import yaml
@@ -24,6 +28,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("EdgeEngineMain")
 
+# Global flag for headless loop execution
+keep_running = True
+
+def _signal_handler(sig, frame):
+    global keep_running
+    logger.info("Signal %s received. Initiating graceful shutdown...", sig)
+    keep_running = False
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
 # Import local modules
 from camera import VideoStream
 from detector import PPEDetector
@@ -32,14 +47,56 @@ from telematics import TelematicsController, TOKEN_ALLOW, TOKEN_DENIED
 from telemetry import TelemetryDispatcher
 
 
+class ConfigWatcher:
+    """
+    Periodically queries the central FastAPI backend for dynamic quality updates
+    (fast, balanced, hd). Runs in a lightweight background daemon thread.
+    """
+    def __init__(self, config_url: str = "http://127.0.0.1:8000/api/edge/config", poll_interval: float = 2.0):
+        self.config_url = config_url
+        self.poll_interval = poll_interval
+        self.inference_size = 640
+        self.jpeg_quality = 70
+        self.quality_mode = "balanced"
+        self._stopped = False
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="ConfigWatcherThread")
+        self._thread.start()
+        logger.info("ConfigWatcher initialized -> polling %s every %.1fs", self.config_url, self.poll_interval)
+
+    def _worker(self):
+        session = requests.Session()
+        while not self._stopped:
+            try:
+                res = session.get(self.config_url, timeout=0.5)
+                if res.status_code == 200:
+                    data = res.json()
+                    new_size = data.get("inference_size", self.inference_size)
+                    new_quality = data.get("jpeg_quality", self.jpeg_quality)
+                    new_mode = data.get("quality", self.quality_mode)
+                    if new_size != self.inference_size or new_quality != self.jpeg_quality or new_mode != self.quality_mode:
+                        self.inference_size = new_size
+                        self.jpeg_quality = new_quality
+                        self.quality_mode = new_mode
+                        logger.info("Dynamic config updated: Mode=%s, ImgSz=%d, JPEG_Q=%d", self.quality_mode, self.inference_size, self.jpeg_quality)
+            except Exception:
+                pass
+            time.sleep(self.poll_interval)
+
+    def stop(self):
+        self._stopped = True
+
+
 class StreamBroadcaster:
     """
     Asynchronously encodes and transmits live annotated video frames
     to the central FastAPI backend MJPEG stream buffer.
+    Strictly non-blocking: skips/drops frames immediately if the previous
+    frame hasn't finished posting to prevent latency accumulation.
     """
-    def __init__(self, stream_url: str = "http://127.0.0.1:8000/api/stream/frame", target_fps: int = 25):
+    def __init__(self, stream_url: str = "http://127.0.0.1:8000/api/stream/frame", target_fps: int = 30, quality_getter=None):
         self.stream_url = stream_url
         self.interval = 1.0 / max(1, target_fps)
+        self.quality_getter = quality_getter
         self._last_send = 0.0
         self._queue = queue.Queue(maxsize=1)
         self._stopped = False
@@ -53,33 +110,29 @@ class StreamBroadcaster:
             return
         self._last_send = now
 
-        # Non-blocking enqueue with latest-frame-only retention
-        if self._queue.full():
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                pass
+        # Strictly non-blocking: drop frame immediately if previous frame hasn't finished posting
         try:
             self._queue.put_nowait(frame)
-        except Exception:
+        except queue.Full:
             pass
 
     def _worker(self):
         session = requests.Session()
         while not self._stopped:
             try:
-                frame = self._queue.get(timeout=0.5)
+                frame = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
             try:
-                ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                quality = self.quality_getter() if self.quality_getter else 70
+                ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if ret:
                     session.post(
                         self.stream_url,
                         data=jpeg.tobytes(),
                         headers={"Content-Type": "image/jpeg"},
-                        timeout=0.3
+                        timeout=0.15
                     )
             except Exception:
                 # Frame posting failures log silently without crashing or interrupting CV loop
@@ -89,6 +142,7 @@ class StreamBroadcaster:
 
     def stop(self):
         self._stopped = True
+
 
 
 
@@ -108,7 +162,9 @@ def draw_hud(
     person_count: int,
     violation_count: int,
     mock_ppe_mode: bool,
-    sim_compliant_override: bool
+    sim_compliant_override: bool,
+    quality_mode: str = "balanced",
+    inference_size: int = 640
 ) -> np.ndarray:
     """
     Renders top status dashboard header HUD onto the frame.
@@ -135,7 +191,7 @@ def draw_hud(
     mode_str = "COMPLIANT" if sim_compliant_override else "SIM_VIOLATION"
     cv2.putText(
         frame,
-        f"FPS: {fps:.1f} | Active Persons: {person_count} | Violations: {violation_count} | PPE Mode: {mode_str} [Key 'M' to toggle]",
+        f"FPS: {fps:.1f} | Persons: {person_count} | Mode: {quality_mode.upper()} ({inference_size}px) | Violations: {violation_count} | PPE: {mode_str}",
         (20, 55),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.45,
@@ -381,10 +437,14 @@ def main():
         cooldown_seconds=telemetry_cfg.get("cooldown_seconds", 4.0)
     )
 
-    # 6. Initialize Live Video Stream Broadcaster
+    # 6. Initialize Config Watcher & Live Video Stream Broadcaster
+    config_endpoint = stream_endpoint.replace("/api/stream/frame", "/api/edge/config")
+    config_watcher = ConfigWatcher(config_url=config_endpoint, poll_interval=1.5)
+
     streamer = StreamBroadcaster(
         stream_url=stream_endpoint,
-        target_fps=args.stream_fps
+        target_fps=args.stream_fps,
+        quality_getter=lambda: config_watcher.jpeg_quality
     )
 
     current_barrier_state = TOKEN_ALLOW
@@ -393,15 +453,11 @@ def main():
     fps_counter = 0
     current_fps = 0.0
 
-    window_name = "Autonomous PPE Verification & Perimeter Access Control"
-    if not args.headless:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1280, 720)
-
-    logger.info("Edge pipeline execution loop started.")
+    # Running in pure headless mode to eliminate Windows GUI thread throttling when minimized
+    logger.info("Edge pipeline execution loop started (pure headless mode).")
 
     try:
-        while True:
+        while keep_running:
             grabbed, frame = camera.read()
             if not grabbed or frame is None:
                 time.sleep(0.01)
@@ -414,8 +470,12 @@ def main():
                 fps_counter = 0
                 fps_time = time.time()
 
-            # Step 1: Detect persons and verify PPE
-            persons = detector.detect_and_verify(frame, sim_override_compliant=sim_compliant_override)
+            # Step 1: Detect persons and verify PPE with dynamic inference size
+            persons = detector.detect_and_verify(
+                frame,
+                sim_override_compliant=sim_compliant_override,
+                imgsz=config_watcher.inference_size
+            )
 
             # Step 2: Evaluate spatial geofence inclusion and breaches
             violations_in_hazard = []
@@ -463,39 +523,23 @@ def main():
                 person_count=len(persons),
                 violation_count=len(violations_in_hazard),
                 mock_ppe_mode=detector.mock_ppe_simulation,
-                sim_compliant_override=sim_compliant_override
+                sim_compliant_override=sim_compliant_override,
+                quality_mode=config_watcher.quality_mode,
+                inference_size=config_watcher.inference_size
             )
 
-            # Step 7: Push Frame to Backend Live Stream Buffer
+            # Step 7: Push Frame to Backend Live Stream Buffer (Strictly Non-Blocking)
             streamer.send_frame(annotated_frame)
-
-            # Local Window GUI
-            if not args.headless:
-                cv2.imshow(window_name, annotated_frame)
-
-                # Handle keyboard inputs
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), ord('Q'), 27):  # 'q' or ESC
-                    logger.info("User requested exit via keyboard.")
-                    break
-                elif key in (ord('m'), ord('M')):
-                    sim_compliant_override = not sim_compliant_override
-                    logger.info("Toggled Mock PPE override. Compliant: %s", sim_compliant_override)
-                elif key in (ord('s'), ord('S')):
-                    manual_path = os.path.join(telemetry.snapshot_dir, f"manual_snapshot_{int(time.time())}.jpg")
-                    cv2.imwrite(manual_path, annotated_frame)
-                    logger.info("Saved manual snapshot: %s", manual_path)
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received.")
     finally:
         logger.info("Cleaning up pipeline resources...")
+        config_watcher.stop()
         streamer.stop()
         camera.stop()
         telemetry.stop()
         telematics.close()
-        if not args.headless:
-            cv2.destroyAllWindows()
         logger.info("Edge pipeline terminated cleanly.")
 
 

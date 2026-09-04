@@ -72,7 +72,12 @@ class PPEDetector:
 
         return in_horizontal and in_head_vertical
 
-    def detect_and_verify(self, frame: np.ndarray, sim_override_compliant: bool = False) -> List[Dict[str, Any]]:
+    def detect_and_verify(
+        self,
+        frame: np.ndarray,
+        sim_override_compliant: bool = False,
+        imgsz: int = 640
+    ) -> List[Dict[str, Any]]:
         """
         Runs object detection on frame, extracts person instances,
         performs spatial containment checks for required PPE, and outputs
@@ -106,12 +111,13 @@ class PPEDetector:
                 "is_compliant": len(missing) == 0
             }]
 
-        # Perform YOLO inference
+        # Perform YOLO inference with dynamic inference resolution
         preds = self.model.predict(
             source=frame,
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            imgsz=imgsz,
             verbose=False
         )
 

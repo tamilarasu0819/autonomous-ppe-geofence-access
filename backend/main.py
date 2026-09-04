@@ -18,9 +18,18 @@ from pydantic import BaseModel
 
 # In-memory buffer holding the latest JPEG frame from Edge Engine
 latest_frame: Optional[bytes] = None
+latest_frame_id: int = 0
 
 # Global reference to running Edge Engine subprocess
 edge_process: Optional[subprocess.Popen] = None
+
+# Global stream quality and inference settings
+stream_config = {
+    "quality": "balanced",
+    "jpeg_quality": 70,
+    "inference_size": 640,
+    "mirror": False
+}
 
 from storage import IncidentStorage
 
@@ -174,27 +183,40 @@ async def upload_stream_frame(request: Request):
     Receives raw JPEG encoded byte frames from the Edge Engine
     and updates the in-memory MJPEG broadcast buffer.
     """
-    global latest_frame
+    global latest_frame, latest_frame_id
     frame_bytes = await request.body()
     if frame_bytes:
         latest_frame = frame_bytes
+        latest_frame_id += 1
     return {"status": "ok"}
 
 
 @app.get("/api/stream/video")
-async def stream_video():
+async def stream_video(request: Request):
     """
     Streams the live OpenCV/YOLOv8 annotated edge camera feed
     as an MJPEG multipart stream to browser clients.
+    Yields ONLY the newest available frame without buffering old frames.
+    Exits immediately when client disconnects to prevent lingering sockets.
     """
     async def frame_generator():
-        while True:
-            if latest_frame is not None:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + latest_frame + b"\r\n"
-                )
-            await asyncio.sleep(0.033)  # ~30 FPS throttle to eliminate CPU spinning
+        last_sent_id = -1
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                curr_id = latest_frame_id
+                curr_frame = latest_frame
+                # Yield strictly when a new frame is available
+                if curr_frame is not None and curr_id != last_sent_id:
+                    last_sent_id = curr_id
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n" + curr_frame + b"\r\n"
+                    )
+                await asyncio.sleep(0.03)  # ~30 FPS limit for strictly real-time delivery
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
 
     return StreamingResponse(
         frame_generator(),
@@ -202,8 +224,9 @@ async def stream_video():
     )
 
 
+
 @app.get("/api/edge/status")
-def get_edge_status():
+async def get_edge_status():
     """
     Returns whether the edge vision engine process is actively running.
     """
@@ -212,7 +235,7 @@ def get_edge_status():
 
 
 @app.post("/api/edge/start")
-def start_edge_engine():
+async def start_edge_engine():
     """
     Spawns edge_engine/main.py as an asynchronous subprocess.
     """
@@ -242,11 +265,11 @@ def start_edge_engine():
 
 
 @app.post("/api/edge/stop")
-def stop_edge_engine():
+async def stop_edge_engine():
     """
     Terminates the edge engine process and resets the live frame buffer.
     """
-    global edge_process, latest_frame
+    global edge_process, latest_frame, latest_frame_id
     if edge_process is not None and edge_process.poll() is None:
         logger.info("Stopping Edge Engine (PID %s)...", edge_process.pid)
         try:
@@ -261,10 +284,56 @@ def stop_edge_engine():
         finally:
             edge_process = None
             latest_frame = None
+            latest_frame_id = 0
         return {"status": "stopped"}
     else:
         edge_process = None
         latest_frame = None
+        latest_frame_id = 0
         return {"status": "not_running"}
+
+
+class QualityConfigUpdate(BaseModel):
+    mode: Optional[str] = None  # "fast", "balanced", "hd"
+    mirror: Optional[bool] = None
+
+
+@app.get("/api/edge/config")
+async def get_edge_config():
+    """
+    Returns the current stream quality and model inference configuration.
+    """
+    return stream_config
+
+
+@app.post("/api/edge/config")
+async def update_edge_config(config_in: QualityConfigUpdate):
+    """
+    Updates the stream compression, YOLO inference resolution, and mirror mode dynamically.
+    Modes:
+      - fast: jpeg_quality=50, inference_size=480 (lowest latency / high FPS)
+      - balanced: jpeg_quality=70, inference_size=640 (standard balance)
+      - hd: jpeg_quality=90, inference_size=1080 (high-resolution details)
+    Mirror:
+      - true: horizontal flip of raw camera frame before inference and HUD rendering
+      - false: normal camera orientation
+    """
+    global stream_config
+    if config_in.mode is not None:
+        mode = config_in.mode.lower().strip()
+        if mode == "fast":
+            stream_config.update({"quality": "fast", "jpeg_quality": 50, "inference_size": 480})
+        elif mode == "hd":
+            stream_config.update({"quality": "hd", "jpeg_quality": 90, "inference_size": 1080})
+        elif mode == "balanced":
+            stream_config.update({"quality": "balanced", "jpeg_quality": 70, "inference_size": 640})
+
+    if config_in.mirror is not None:
+        stream_config["mirror"] = bool(config_in.mirror)
+
+    logger.info("Stream configuration updated: %s", stream_config)
+    return stream_config
+
+
 
 

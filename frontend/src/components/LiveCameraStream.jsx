@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Video, Play, Pause, RefreshCw, AlertCircle, Square, Power, PowerOff, Cpu } from 'lucide-react';
+import { Video, Play, Pause, RefreshCw, AlertCircle, Square, PowerOff } from 'lucide-react';
 
 const API_BASE = "http://127.0.0.1:8000";
 const STREAM_URL = `${API_BASE}/api/stream/video`;
@@ -8,6 +8,8 @@ export default function LiveCameraStream() {
   const [isEngineRunning, setIsEngineRunning] = useState(false);
   const [isOperating, setIsOperating] = useState(false);
   const [isPlaying, setIsPlaying] = useState(true);
+  const [isMirrored, setIsMirrored] = useState(false);
+  const [qualityMode, setQualityMode] = useState("balanced");
   const [streamError, setStreamError] = useState(false);
   const [key, setKey] = useState(Date.now()); // Hard refresh key for MJPEG reconnect
 
@@ -24,11 +26,41 @@ export default function LiveCameraStream() {
     }
   };
 
+  // Fetch initial stream quality configuration
+  const fetchConfig = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/edge/config`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.quality) {
+          setQualityMode(data.quality);
+        }
+      }
+    } catch (err) {
+      // Backend offline
+    }
+  };
+
   useEffect(() => {
     checkEdgeStatus();
+    fetchConfig();
     const interval = setInterval(checkEdgeStatus, 2500);
     return () => clearInterval(interval);
   }, []);
+
+  // Update dynamic quality configuration
+  const handleQualityChange = async (mode) => {
+    setQualityMode(mode);
+    try {
+      await fetch(`${API_BASE}/api/edge/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode })
+      });
+    } catch (err) {
+      console.error("Failed to update stream quality:", err);
+    }
+  };
 
   // Start / Stop Camera Engine
   const toggleCameraEngine = async () => {
@@ -70,6 +102,7 @@ export default function LiveCameraStream() {
     setKey(Date.now());
     setIsPlaying(true);
     checkEdgeStatus();
+    fetchConfig();
   };
 
   return (
@@ -97,12 +130,12 @@ export default function LiveCameraStream() {
           {isEngineRunning ? (
             <div className="flex items-center space-x-2 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-500/40 text-emerald-400 text-xs font-mono">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span>EDGE FEED ACTIVE (LOCAL MOCK)</span>
+              <span>EDGE FEED ACTIVE</span>
             </div>
           ) : (
             <div className="flex items-center space-x-2 px-2.5 py-1 rounded-full bg-slate-800/80 border border-slate-700 text-slate-400 text-xs font-mono">
               <span className="w-2 h-2 rounded-full bg-slate-500" />
-              <span>CAMERA ENGINE STOPPED</span>
+              <span>CAMERA STOPPED</span>
             </div>
           )}
 
@@ -140,12 +173,12 @@ export default function LiveCameraStream() {
               {isPlaying ? (
                 <>
                   <Pause className="w-3.5 h-3.5" />
-                  <span>Pause Stream</span>
+                  <span>Pause</span>
                 </>
               ) : (
                 <>
                   <Play className="w-3.5 h-3.5" />
-                  <span>Resume Stream</span>
+                  <span>Resume</span>
                 </>
               )}
             </button>
@@ -158,6 +191,56 @@ export default function LiveCameraStream() {
             className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition"
           >
             <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Quality Mode & Mirroring Toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 pt-2 pb-1 border-t border-slate-800/80">
+        {/* Quality Mode Button Group */}
+        <div className="flex items-center space-x-2">
+          <span className="text-xs text-slate-400 font-mono">Quality:</span>
+          <div className="inline-flex rounded-lg p-0.5 bg-slate-950 border border-slate-800">
+            <button
+              onClick={() => handleQualityChange("fast")}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition ${
+                qualityMode === "fast"
+                  ? "bg-orange-600 text-white shadow-sm"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              ⚡ Fast (High FPS)
+            </button>
+            <button
+              onClick={() => handleQualityChange("balanced")}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition ${
+                qualityMode === "balanced"
+                  ? "bg-orange-600 text-white shadow-sm"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              ⚖️ Balanced
+            </button>
+            <button
+              onClick={() => handleQualityChange("hd")}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition ${
+                qualityMode === "hd"
+                  ? "bg-orange-600 text-white shadow-sm"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              🎬 HD
+            </button>
+          </div>
+        </div>
+
+        {/* Mirror Toggle Button */}
+        <div>
+          <button
+            onClick={() => setIsMirrored(!isMirrored)}
+            className="px-3 py-1 bg-slate-800 rounded text-xs border border-slate-700 hover:bg-slate-700 transition text-slate-200"
+          >
+            {isMirrored ? "🪞 Mirrored (Selfie)" : "📷 Normal (World)"}
           </button>
         </div>
       </div>
@@ -191,7 +274,7 @@ export default function LiveCameraStream() {
               key={key}
               src={`${STREAM_URL}?t=${key}`}
               alt="Live Stream"
-              className="w-full h-auto rounded-lg border border-slate-700 bg-slate-900 object-cover"
+              className={`w-full h-auto rounded-lg border border-slate-700 bg-slate-900 object-cover transition-transform duration-200 ${isMirrored ? "-scale-x-100" : ""}`}
               onError={() => setStreamError(true)}
               onLoad={() => setStreamError(false)}
             />
