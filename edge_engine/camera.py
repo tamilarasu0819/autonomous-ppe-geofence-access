@@ -65,6 +65,11 @@ class VideoStream:
                 logger.warning("Could not open source %s. Will attempt retry or synthetic fallback.", self.source)
                 return False
 
+            # Set MJPG FourCC codec to enable hardware 30 FPS stream on Windows DirectShow
+            try:
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            except Exception:
+                pass
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
             self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)

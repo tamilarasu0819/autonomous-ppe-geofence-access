@@ -41,7 +41,10 @@ class PPEDetector:
             from ultralytics import YOLO
             logger.info("Loading YOLO model from: %s on device: %s", self.model_path, self.device)
             self.model = YOLO(self.model_path)
-            logger.info("YOLO model loaded successfully.")
+            logger.info("YOLO model loaded. Running warmup forward pass...")
+            dummy = np.zeros((384, 384, 3), dtype=np.uint8)
+            self.model.predict(source=dummy, imgsz=384, device=self.device, verbose=False)
+            logger.info("YOLO model warmup complete and ready for real-time inference.")
         except Exception as e:
             logger.error("Failed to load YOLO model: %s. Using heuristic fallback.", e)
             self.model = None

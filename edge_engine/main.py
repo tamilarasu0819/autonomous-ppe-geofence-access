@@ -52,12 +52,12 @@ class ConfigWatcher:
     Periodically queries the central FastAPI backend for dynamic quality updates
     (fast, balanced, hd). Runs in a lightweight background daemon thread.
     """
-    def __init__(self, config_url: str = "http://127.0.0.1:8000/api/edge/config", poll_interval: float = 2.0):
+    def __init__(self, config_url: str = "http://127.0.0.1:8000/api/edge/config", poll_interval: float = 1.5):
         self.config_url = config_url
         self.poll_interval = poll_interval
-        self.inference_size = 640
-        self.jpeg_quality = 70
-        self.quality_mode = "balanced"
+        self.inference_size = 384
+        self.jpeg_quality = 55
+        self.quality_mode = "fast"
         self._stopped = False
         self._thread = threading.Thread(target=self._worker, daemon=True, name="ConfigWatcherThread")
         self._thread.start()
@@ -118,30 +118,154 @@ class StreamBroadcaster:
 
     def _worker(self):
         session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        session.mount("http://", adapter)
+        session.headers.update({"Connection": "keep-alive"})
+
         while not self._stopped:
             try:
-                frame = self._queue.get(timeout=0.2)
+                frame = self._queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
             try:
-                quality = self.quality_getter() if self.quality_getter else 70
+                quality = self.quality_getter() if self.quality_getter else 55
                 ret, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if ret:
                     session.post(
                         self.stream_url,
                         data=jpeg.tobytes(),
                         headers={"Content-Type": "image/jpeg"},
-                        timeout=0.15
+                        timeout=0.25
                     )
             except Exception:
-                # Frame posting failures log silently without crashing or interrupting CV loop
                 pass
             finally:
                 self._queue.task_done()
 
     def stop(self):
         self._stopped = True
+
+
+class AsyncInferenceWorker:
+    """
+    Decoupled Asynchronous Vision & Geofence Worker.
+    Executes YOLOv8 object detection, PPE verification, spatial homography geofencing,
+    and HAL telematics in a dedicated background thread.
+    This guarantees that the main camera capture and streaming loop runs at full
+    hardware speed (30+ FPS) without frame drops or UI stuttering.
+    """
+    def __init__(self, detector, geofence, telematics, telemetry):
+        self.detector = detector
+        self.geofence = geofence
+        self.telematics = telematics
+        self.telemetry = telemetry
+
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.new_frame_event = threading.Event()
+
+        self.results_lock = threading.Lock()
+        self.persons = []
+        self.evaluations = []
+        self.violations_in_hazard = []
+        self.current_barrier_state = TOKEN_ALLOW
+
+        self.infer_ms = 0.0
+        self.infer_fps = 0.0
+        self.sim_override = False
+        self.inference_size = 384
+        self.stopped = False
+
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True, name="InferenceWorkerThread")
+        self.thread.start()
+        logger.info("AsyncInferenceWorker initialized: decoupled 30+ FPS vision pipeline active.")
+
+    def submit_frame(self, frame: np.ndarray, sim_override: bool, imgsz: int):
+        """Passes the newest available camera frame to the background inference worker."""
+        self.sim_override = sim_override
+        self.inference_size = imgsz
+        with self.frame_lock:
+            self.latest_frame = frame
+        self.new_frame_event.set()
+
+    def get_latest_results(self):
+        """Sub-millisecond thread-safe access to the most recent inference & tracking results."""
+        with self.results_lock:
+            return (
+                self.persons,
+                self.evaluations,
+                self.violations_in_hazard,
+                self.current_barrier_state,
+                self.infer_ms,
+                self.infer_fps
+            )
+
+    def _worker_loop(self):
+        fps_counter = 0
+        fps_time = time.time()
+
+        while not self.stopped:
+            if not self.new_frame_event.wait(timeout=0.1):
+                continue
+            self.new_frame_event.clear()
+
+            with self.frame_lock:
+                frame = self.latest_frame
+                if frame is None:
+                    continue
+                process_frame = frame
+
+            t0 = time.time()
+            try:
+                # 1. YOLOv8 PPE detection
+                persons = self.detector.detect_and_verify(
+                    process_frame,
+                    sim_override_compliant=self.sim_override,
+                    imgsz=self.inference_size
+                )
+
+                # 2. Geofence evaluation
+                violations = []
+                evals = []
+                for person in persons:
+                    eval_data = self.geofence.evaluate_person(person["bbox"])
+                    evals.append(eval_data)
+                    if eval_data["in_hazard_zone"] and not person["is_compliant"]:
+                        violations.append((person, eval_data))
+
+                # 3. Access Barrier State
+                desired_state = TOKEN_DENIED if len(violations) > 0 else TOKEN_ALLOW
+
+                # 4. Dispatch Telematics
+                if desired_state != self.current_barrier_state:
+                    self.telematics.dispatch_state(desired_state)
+
+                # 5. Dispatch Telemetry Evidence
+                for person, eval_data in violations:
+                    self.telemetry.record_violation(process_frame, person, eval_data)
+
+                # Compute inference metrics
+                elapsed = (time.time() - t0) * 1000.0
+                fps_counter += 1
+                if time.time() - fps_time >= 1.0:
+                    self.infer_fps = fps_counter / (time.time() - fps_time)
+                    fps_counter = 0
+                    fps_time = time.time()
+
+                with self.results_lock:
+                    self.persons = persons
+                    self.evaluations = evals
+                    self.violations_in_hazard = violations
+                    self.current_barrier_state = desired_state
+                    self.infer_ms = elapsed
+
+            except Exception as e:
+                logger.error("Error in inference worker: %s", e)
+
+    def stop(self):
+        self.stopped = True
+        self.new_frame_event.set()
 
 
 
@@ -159,12 +283,13 @@ def draw_hud(
     frame: np.ndarray,
     barrier_state: int,
     fps: float,
-    person_count: int,
-    violation_count: int,
-    mock_ppe_mode: bool,
-    sim_compliant_override: bool,
-    quality_mode: str = "balanced",
-    inference_size: int = 640
+    infer_ms: float = 0.0,
+    person_count: int = 0,
+    violation_count: int = 0,
+    mock_ppe_mode: bool = False,
+    sim_compliant_override: bool = False,
+    quality_mode: str = "fast",
+    inference_size: int = 384
 ) -> np.ndarray:
     """
     Renders top status dashboard header HUD onto the frame.
@@ -191,7 +316,7 @@ def draw_hud(
     mode_str = "COMPLIANT" if sim_compliant_override else "SIM_VIOLATION"
     cv2.putText(
         frame,
-        f"FPS: {fps:.1f} | Persons: {person_count} | Mode: {quality_mode.upper()} ({inference_size}px) | Violations: {violation_count} | PPE: {mode_str}",
+        f"DISPLAY FPS: {fps:.1f} | INFER: {infer_ms:.0f}ms | Persons: {person_count} | Mode: {quality_mode.upper()} ({inference_size}px) | Violations: {violation_count} | PPE: {mode_str}",
         (20, 55),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.45,
@@ -447,64 +572,54 @@ def main():
         quality_getter=lambda: config_watcher.jpeg_quality
     )
 
-    current_barrier_state = TOKEN_ALLOW
+    # 7. Initialize Decoupled Asynchronous Inference Worker
+    inference_worker = AsyncInferenceWorker(
+        detector=detector,
+        geofence=geofence,
+        telematics=telematics,
+        telemetry=telemetry
+    )
+
     sim_compliant_override = False
     fps_time = time.time()
     fps_counter = 0
     current_fps = 0.0
 
-    # Running in pure headless mode to eliminate Windows GUI thread throttling when minimized
-    logger.info("Edge pipeline execution loop started (pure headless mode).")
+    logger.info("Edge pipeline execution loop started (decoupled high-FPS display mode).")
 
     try:
         while keep_running:
             grabbed, frame = camera.read()
             if not grabbed or frame is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
 
-            # Update FPS tracking
+            # Update real-time display FPS tracking
             fps_counter += 1
-            if time.time() - fps_time >= 1.0:
-                current_fps = fps_counter / (time.time() - fps_time)
+            now = time.time()
+            if now - fps_time >= 1.0:
+                current_fps = fps_counter / (now - fps_time)
                 fps_counter = 0
-                fps_time = time.time()
+                fps_time = now
 
-            # Step 1: Detect persons and verify PPE with dynamic inference size
-            persons = detector.detect_and_verify(
+            # Step 1: Submit newest camera frame to background inference worker (non-blocking)
+            inference_worker.submit_frame(
                 frame,
-                sim_override_compliant=sim_compliant_override,
+                sim_override=sim_compliant_override,
                 imgsz=config_watcher.inference_size
             )
 
-            # Step 2: Evaluate spatial geofence inclusion and breaches
-            violations_in_hazard = []
-            evaluations = []
+            # Step 2: Retrieve latest tracked persons and barrier state instantly
+            (
+                persons,
+                evaluations,
+                violations_in_hazard,
+                current_barrier_state,
+                infer_ms,
+                infer_fps
+            ) = inference_worker.get_latest_results()
 
-            for person in persons:
-                eval_data = geofence.evaluate_person(person["bbox"])
-                evaluations.append(eval_data)
-
-                # Check breach condition: Inside hazard zone AND missing required PPE
-                if eval_data["in_hazard_zone"] and not person["is_compliant"]:
-                    violations_in_hazard.append((person, eval_data))
-
-            # Step 3: Determine Physical Access Barrier State
-            if len(violations_in_hazard) > 0:
-                desired_state = TOKEN_DENIED
-            else:
-                desired_state = TOKEN_ALLOW
-
-            # Step 4: Dispatch Telematics State Change / Keepalive
-            if desired_state != current_barrier_state:
-                telematics.dispatch_state(desired_state)
-                current_barrier_state = desired_state
-
-            # Step 5: Asynchronous Evidence & Telemetry Logging
-            for person, eval_data in violations_in_hazard:
-                telemetry.record_violation(frame, person, eval_data)
-
-            # Step 6: Visual Rendering & Frame Annotation
+            # Step 3: Visual Rendering & Frame Annotation
             annotated_frame = frame.copy()
 
             # Render hazard polygon overlay
@@ -520,6 +635,7 @@ def main():
                 annotated_frame,
                 barrier_state=current_barrier_state,
                 fps=current_fps,
+                infer_ms=infer_ms,
                 person_count=len(persons),
                 violation_count=len(violations_in_hazard),
                 mock_ppe_mode=detector.mock_ppe_simulation,
@@ -528,13 +644,14 @@ def main():
                 inference_size=config_watcher.inference_size
             )
 
-            # Step 7: Push Frame to Backend Live Stream Buffer (Strictly Non-Blocking)
+            # Step 4: Push Frame to Backend Live Stream Buffer (Strictly Non-Blocking)
             streamer.send_frame(annotated_frame)
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received.")
     finally:
         logger.info("Cleaning up pipeline resources...")
+        inference_worker.stop()
         config_watcher.stop()
         streamer.stop()
         camera.stop()

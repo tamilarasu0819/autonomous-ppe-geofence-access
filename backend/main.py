@@ -25,9 +25,9 @@ edge_process: Optional[subprocess.Popen] = None
 
 # Global stream quality and inference settings
 stream_config = {
-    "quality": "balanced",
-    "jpeg_quality": 70,
-    "inference_size": 640,
+    "quality": "fast",
+    "jpeg_quality": 55,
+    "inference_size": 384,
     "mirror": False
 }
 
@@ -220,7 +220,11 @@ async def stream_video(request: Request):
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n\r\n" + curr_frame + b"\r\n"
                     )
-                await asyncio.sleep(0.03)  # ~30 FPS limit for strictly real-time delivery
+                    # Yield to event loop immediately without sleeping 30ms
+                    await asyncio.sleep(0.001)
+                else:
+                    # Small wait when waiting for new frame
+                    await asyncio.sleep(0.005)
         except (asyncio.CancelledError, GeneratorExit):
             pass
 
@@ -328,11 +332,11 @@ async def update_edge_config(config_in: QualityConfigUpdate):
     if config_in.mode is not None:
         mode = config_in.mode.lower().strip()
         if mode == "fast":
-            stream_config.update({"quality": "fast", "jpeg_quality": 50, "inference_size": 480})
+            stream_config.update({"quality": "fast", "jpeg_quality": 50, "inference_size": 384})
         elif mode == "hd":
-            stream_config.update({"quality": "hd", "jpeg_quality": 90, "inference_size": 1080})
+            stream_config.update({"quality": "hd", "jpeg_quality": 85, "inference_size": 640})
         elif mode == "balanced":
-            stream_config.update({"quality": "balanced", "jpeg_quality": 70, "inference_size": 640})
+            stream_config.update({"quality": "balanced", "jpeg_quality": 65, "inference_size": 480})
 
     if config_in.mirror is not None:
         stream_config["mirror"] = bool(config_in.mirror)
