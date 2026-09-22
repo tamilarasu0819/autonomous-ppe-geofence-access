@@ -11,7 +11,7 @@ export default function LiveCameraStream() {
   const [isMirrored, setIsMirrored] = useState(false);
   const [qualityMode, setQualityMode] = useState("balanced");
   const [streamError, setStreamError] = useState(false);
-  const [key, setKey] = useState(Date.now()); // Hard refresh key for MJPEG reconnect
+  const [streamTimestamp, setStreamTimestamp] = useState(Date.now()); // Hard refresh key for MJPEG reconnect
 
   // Sync edge engine status with backend
   const checkEdgeStatus = async () => {
@@ -73,12 +73,12 @@ export default function LiveCameraStream() {
           setStreamError(false);
         }
       } else {
-        const res = await fetch(`${API_BASE}/api/edge/start`, { method: "POST" });
+        const res = await fetch("http://127.0.0.1:8000/api/edge/start", { method: "POST" });
         if (res.ok) {
           setIsEngineRunning(true);
           setIsPlaying(true);
           setStreamError(false);
-          setKey(Date.now());
+          setStreamTimestamp(Date.now());
         }
       }
     } catch (err) {
@@ -92,14 +92,14 @@ export default function LiveCameraStream() {
   const handleToggleStream = () => {
     if (!isPlaying) {
       setStreamError(false);
-      setKey(Date.now());
+      setStreamTimestamp(Date.now());
     }
     setIsPlaying(!isPlaying);
   };
 
   const handleRefresh = () => {
     setStreamError(false);
-    setKey(Date.now());
+    setStreamTimestamp(Date.now());
     setIsPlaying(true);
     checkEdgeStatus();
     fetchConfig();
@@ -271,8 +271,8 @@ export default function LiveCameraStream() {
         ) : isPlaying ? (
           <>
             <img
-              key={key}
-              src={`${STREAM_URL}?t=${key}`}
+              key={streamTimestamp}
+              src={`http://127.0.0.1:8000/api/stream/video?t=${streamTimestamp}`}
               alt="Live Stream"
               className={`w-full h-auto rounded-lg border border-slate-700 bg-slate-900 object-cover transition-transform duration-200 ${isMirrored ? "-scale-x-100" : ""}`}
               onError={() => setStreamError(true)}
