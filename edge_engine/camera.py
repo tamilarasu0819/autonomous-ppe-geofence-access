@@ -3,6 +3,7 @@ Camera Abstraction Layer with Threaded Capture & Auto-Reconnection
 Autonomous PPE Verification and Perimeter Access Control
 """
 
+import os
 import cv2
 import time
 import logging
@@ -40,6 +41,14 @@ class VideoStream:
         self.max_reconnect_attempts = max_reconnect_attempts
         self.buffer_size = buffer_size
 
+        # Check if source is a local video file
+        self.is_file = False
+        if isinstance(self.source, str):
+            if os.path.isfile(self.source):
+                self.is_file = True
+            elif self.source.isdigit():
+                self.source = int(self.source)
+
         self.cap: Optional[cv2.VideoCapture] = None
         self.grabbed: bool = False
         self.frame: Optional[np.ndarray] = None
@@ -53,27 +62,33 @@ class VideoStream:
 
     def _init_capture(self) -> bool:
         """Initializes VideoCapture backend."""
-        logger.info("Initializing VideoStream from source: %s", self.source)
+        logger.info("Initializing VideoStream from source: %s (is_file=%s)", self.source, self.is_file)
         try:
-            # On Windows, cv2.CAP_DSHOW can significantly reduce webcam startup time
-            if isinstance(self.source, int):
+            if self.is_file:
+                self.cap = cv2.VideoCapture(self.source)
+                if self.cap and self.cap.isOpened():
+                    fps = self.cap.get(cv2.CAP_PROP_FPS)
+                    if fps and fps > 0:
+                        self.target_fps = int(fps)
+                    logger.info("Opened video file: %s (FPS=%d)", self.source, self.target_fps)
+            elif isinstance(self.source, int):
+                # On Windows, cv2.CAP_DSHOW can significantly reduce webcam startup time
                 self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+                # Set MJPG FourCC codec to enable hardware 30 FPS stream on Windows DirectShow
+                try:
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                except Exception:
+                    pass
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+                self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
             else:
                 self.cap = cv2.VideoCapture(self.source)
 
             if not self.cap or not self.cap.isOpened():
                 logger.warning("Could not open source %s. Will attempt retry or synthetic fallback.", self.source)
                 return False
-
-            # Set MJPG FourCC codec to enable hardware 30 FPS stream on Windows DirectShow
-            try:
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            except Exception:
-                pass
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
-            self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
 
             ret, frame = self.cap.read()
             if ret and frame is not None:
@@ -107,26 +122,43 @@ class VideoStream:
         """Continuous frame polling loop running in dedicated thread."""
         while not self.stopped:
             if self.use_synthetic_fallback:
-                time.sleep(1.0 / self.target_fps)
+                time.sleep(1.0 / max(1, self.target_fps))
                 with self.lock:
                     self.frame = self._generate_synthetic_frame()
                     self.grabbed = True
                 continue
 
             if self.cap is None or not self.cap.isOpened():
-                logger.warning("Camera disconnected. Initiating reconnection routine...")
-                reconnected = self._attempt_reconnect()
-                if not reconnected:
-                    logger.warning("Stream unavailable. Falling back to synthetic feed.")
-                    self.use_synthetic_fallback = True
-                    continue
+                if self.is_file:
+                    logger.warning("Video file stream not opened. Retrying...")
+                    if self._init_capture():
+                        continue
+                else:
+                    logger.warning("Camera disconnected. Initiating reconnection routine...")
+                    reconnected = self._attempt_reconnect()
+                    if not reconnected:
+                        logger.warning("Stream unavailable. Falling back to synthetic feed.")
+                        self.use_synthetic_fallback = True
+                        continue
 
             ret, frame = self.cap.read()
             if ret and frame is not None:
                 with self.lock:
                     self.frame = frame
                     self.grabbed = True
+                if self.is_file:
+                    time.sleep(1.0 / max(1, self.target_fps))
             else:
+                # If processing a video file, loop continuously when EOF is reached
+                if self.is_file and self.cap is not None and self.cap.isOpened():
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None:
+                        with self.lock:
+                            self.frame = frame
+                            self.grabbed = True
+                        time.sleep(1.0 / max(1, self.target_fps))
+                        continue
                 # Frame drop or stream freeze
                 with self.lock:
                     self.grabbed = False

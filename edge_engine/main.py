@@ -493,13 +493,14 @@ def main():
     telematics_cfg = cfg.get("telematics", {})
     telemetry_cfg = cfg.get("telemetry", {})
 
-    # Override options via CLI if provided
+    # Override options via CLI or environment if provided
     cam_source = camera_cfg.get("source", 0)
-    if args.source is not None:
+    source_arg = args.source if args.source is not None else os.environ.get("CAMERA_SOURCE")
+    if source_arg is not None:
         try:
-            cam_source = int(args.source)
+            cam_source = int(source_arg)
         except ValueError:
-            cam_source = args.source
+            cam_source = source_arg
 
     mock_hardware = telematics_cfg.get("mock_mode", True)
     if args.mock_hardware is not None:

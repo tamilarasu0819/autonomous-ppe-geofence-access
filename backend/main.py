@@ -10,7 +10,7 @@ import logging
 import asyncio
 import subprocess
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
@@ -61,6 +61,12 @@ app.add_middleware(
 SNAPSHOT_DIR = os.path.join(os.path.dirname(__file__), "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 app.mount("/snapshots", StaticFiles(directory=SNAPSHOT_DIR), name="snapshots")
+
+# Ensure upload directory exists for offline video files
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 storage = IncidentStorage(snapshot_dir=SNAPSHOT_DIR)
 
@@ -244,31 +250,75 @@ async def get_edge_status():
     return {"running": is_running}
 
 
+@app.post("/api/video/upload")
+async def upload_video(file: UploadFile = File(...)):
+    """
+    Accepts a video file upload (mp4, avi, mov, etc.), saves it to uploads/<filename>,
+    and returns {"status": "uploaded", "filepath": "uploads/<filename>"}.
+    """
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No video file provided.")
+
+    filename = os.path.basename(file.filename)
+    clean_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
+    if not clean_filename:
+        clean_filename = f"video_{int(time.time())}.mp4"
+
+    save_path = os.path.join(UPLOAD_DIR, clean_filename)
+    content = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    rel_filepath = f"uploads/{clean_filename}"
+    logger.info("Video file uploaded successfully: %s (%d bytes)", rel_filepath, len(content))
+    return {
+        "status": "uploaded",
+        "filepath": rel_filepath
+    }
+
+
+class EdgeStartConfig(BaseModel):
+    source_type: Optional[str] = "webcam"
+    file_path: Optional[str] = None
+
+
 @app.post("/api/edge/start")
-async def start_edge_engine():
+async def start_edge_engine(config: Optional[EdgeStartConfig] = Body(None)):
     """
     Spawns edge_engine/main.py as an asynchronous subprocess.
+    Accepts optional JSON body: {"source_type": "webcam" | "file", "file_path": "uploads/sample.mp4"}
     """
     global edge_process
+    
+    # If already running, terminate previous process before starting with new source
     if edge_process is not None and edge_process.poll() is None:
-        return {"status": "already_running"}
+        logger.info("Restarting Edge Engine with new configuration...")
+        await stop_edge_engine()
 
-    # Resolve project root and edge_engine script path
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    edge_script = os.path.join(project_root, "edge_engine", "main.py")
+    edge_script = os.path.join(PROJECT_ROOT, "edge_engine", "main.py")
     if not os.path.exists(edge_script):
         edge_script = "edge_engine/main.py"
-        project_root = os.getcwd()
 
     cmd = [sys.executable, edge_script]
-    logger.info("Launching Edge Engine: %s in cwd: %s", cmd, project_root)
+    if config and config.source_type == "file" and config.file_path:
+        cmd.extend(["--source", config.file_path])
+        logger.info("Launching Edge Engine with video file source: %s", config.file_path)
+    else:
+        logger.info("Launching Edge Engine with live webcam source.")
+
+    logger.info("Launching Edge Engine: %s in cwd: %s", cmd, PROJECT_ROOT)
 
     try:
         edge_process = subprocess.Popen(
             cmd,
-            cwd=project_root
+            cwd=PROJECT_ROOT
         )
-        return {"status": "started", "pid": edge_process.pid}
+        return {
+            "status": "started",
+            "pid": edge_process.pid,
+            "source_type": config.source_type if config else "webcam",
+            "file_path": config.file_path if config else None
+        }
     except Exception as e:
         logger.error("Failed to start Edge Engine: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
